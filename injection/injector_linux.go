@@ -8,7 +8,6 @@ import (
 	"encoding/binary"
 	"fmt"
 	"log"
-	"net"
 	"os"
 	"os/exec"
 	"strconv"
@@ -25,8 +24,6 @@ import (
 )
 
 const (
-	fallbackTCPPayloadMax = 1000
-
 	sysctlNetNFQueueMaxLen = "/proc/sys/net/netfilter/nf_queue_maxlen"
 	sysctlNetCoreRmemMax   = "/proc/sys/net/core/rmem_max"
 
@@ -59,17 +56,27 @@ type FakeTcpInjector struct {
 	nf          *nfqueue.Nfqueue
 	rawFd       int
 	Connections sync.Map
-	interfaceIP string
-	connectIP   string
-	connectPort uint16
-	nicMTU      int
-	nfqueueNum  uint16
-	fwMark      int
-	ctx         context.Context
-	cancel      context.CancelFunc
+	// byLocalPort indexes flows by ephemeral local port when the IPv4 SrcIP on the wire
+	// does not match ConnID.SrcIP (e.g. route-chosen address vs -interface IP).
+	byLocalPort     sync.Map // uint16 -> *FakeInjectiveConnection
+	connectIP       string
+	connectPort     uint16
+	nicMTU          int
+	nfqueueNum      uint16
+	fwMark          int
+	ctx             context.Context
+	cancel          context.CancelFunc
+	injectorReady   chan struct{}
+	injectorOpenErr error
+	closeOnce       sync.Once
 }
 
-func NewFakeTcpInjector(interfaceIP, connectIP string, connectPort uint16) (*FakeTcpInjector, error) {
+func NewFakeTcpInjector(interfaceIP string, connectIPv4s []string, connectPort uint16) (*FakeTcpInjector, error) {
+	if len(connectIPv4s) == 0 {
+		return nil, fmt.Errorf("no upstream IPv4 addresses")
+	}
+	connectIP := connectIPv4s[0]
+
 	ctx, cancel := context.WithCancel(context.Background())
 
 	qid, err := randomNFQueueID()
@@ -85,15 +92,15 @@ func NewFakeTcpInjector(interfaceIP, connectIP string, connectPort uint16) (*Fak
 
 	mtu := nicMTUForLocalIPv4(interfaceIP)
 	f := &FakeTcpInjector{
-		interfaceIP: interfaceIP,
-		connectIP:   connectIP,
-		connectPort: connectPort,
-		nicMTU:      mtu,
-		nfqueueNum:  qid,
-		fwMark:      mark,
-		ctx:         ctx,
-		cancel:      cancel,
-		rawFd:       -1,
+		connectIP:     connectIP,
+		connectPort:   connectPort,
+		nicMTU:        mtu,
+		nfqueueNum:    qid,
+		fwMark:        mark,
+		ctx:           ctx,
+		cancel:        cancel,
+		rawFd:         -1,
+		injectorReady: make(chan struct{}),
 	}
 	if mtu > 0 {
 		log.Printf("injector: NIC MTU %d for %s", mtu, interfaceIP)
@@ -106,8 +113,16 @@ func NewFakeTcpInjector(interfaceIP, connectIP string, connectPort uint16) (*Fak
 		cancel()
 		return nil, fmt.Errorf("failed to create raw socket: %w", err)
 	}
-	syscall.SetsockoptInt(fd, syscall.IPPROTO_IP, syscall.IP_HDRINCL, 1)
-	syscall.SetsockoptInt(fd, syscall.SOL_SOCKET, syscall.SO_MARK, f.fwMark)
+	if err := syscall.SetsockoptInt(fd, syscall.IPPROTO_IP, syscall.IP_HDRINCL, 1); err != nil {
+		syscall.Close(fd)
+		cancel()
+		return nil, fmt.Errorf("IP_HDRINCL: %w", err)
+	}
+	if err := syscall.SetsockoptInt(fd, syscall.SOL_SOCKET, syscall.SO_MARK, f.fwMark); err != nil {
+		syscall.Close(fd)
+		cancel()
+		return nil, fmt.Errorf("SO_MARK: %w", err)
+	}
 	if err := unix.SetsockoptInt(fd, unix.IPPROTO_IP, unix.IP_MTU_DISCOVER, unix.IP_PMTUDISC_DONT); err != nil {
 		syscall.Close(fd)
 		cancel()
@@ -201,73 +216,11 @@ func netlinkRecvBufFromSysctl() int {
 	return desiredNetlinkRcvBuf
 }
 
-// nicMTUForLocalIPv4 returns the MTU of the interface that owns localIPv4, or 0.
-func nicMTUForLocalIPv4(localIPv4 string) int {
-	ip := net.ParseIP(localIPv4)
-	if ip == nil {
-		return 0
-	}
-	ip4 := ip.To4()
-	if ip4 == nil {
-		return 0
-	}
-	ifaces, err := net.Interfaces()
-	if err != nil {
-		return 0
-	}
-	for _, iface := range ifaces {
-		addrs, err := iface.Addrs()
-		if err != nil {
-			continue
-		}
-		for _, a := range addrs {
-			var cand net.IP
-			switch v := a.(type) {
-			case *net.IPNet:
-				cand = v.IP
-			case *net.IPAddr:
-				cand = v.IP
-			default:
-				continue
-			}
-			cand = cand.To4()
-			if cand == nil || !cand.Equal(ip4) {
-				continue
-			}
-			return iface.MTU
-		}
-	}
-	return 0
-}
-
-// segmentMSS returns max TCP payload bytes per injected packet from NIC MTU and template IPv4/TCP headers.
-func segmentMSS(nicMTU int, template []byte) int {
-	if nicMTU <= 0 || packet.IPVersion(template) != 4 {
-		return fallbackTCPPayloadMax
-	}
-	ipLen := packet.IPHeaderLen(template)
-	tcpLen := packet.TCPDataOffset(template)
-	if ipLen < 20 || tcpLen < 20 {
-		return fallbackTCPPayloadMax
-	}
-	overhead := ipLen + tcpLen
-	if nicMTU <= overhead {
-		return fallbackTCPPayloadMax
-	}
-	mss := nicMTU - overhead
-	if mss < 128 {
-		return fallbackTCPPayloadMax
-	}
-	return mss
-}
-
-// setupIptables adds iptables rules to redirect relevant TCP packets to nfqueue.
 func (f *FakeTcpInjector) setupIptables() error {
 	port := fmt.Sprintf("%d", f.connectPort)
 	mark := fmt.Sprintf("0x%x", f.fwMark)
 	queueNum := fmt.Sprintf("%d", f.nfqueueNum)
 
-	// OUTPUT: outbound packets to target (skip packets with our fwmark)
 	if err := runCmd("iptables", "-I", "OUTPUT", "-p", "tcp",
 		"-d", f.connectIP, "--dport", port,
 		"-m", "mark", "!", "--mark", mark,
@@ -275,11 +228,9 @@ func (f *FakeTcpInjector) setupIptables() error {
 		return fmt.Errorf("iptables OUTPUT rule: %w", err)
 	}
 
-	// INPUT: inbound packets from target
 	if err := runCmd("iptables", "-I", "INPUT", "-p", "tcp",
 		"-s", f.connectIP, "--sport", port,
 		"-j", "NFQUEUE", "--queue-num", queueNum); err != nil {
-		// Cleanup the OUTPUT rule we just added
 		runCmd("iptables", "-D", "OUTPUT", "-p", "tcp",
 			"-d", f.connectIP, "--dport", port,
 			"-m", "mark", "!", "--mark", mark,
@@ -291,7 +242,6 @@ func (f *FakeTcpInjector) setupIptables() error {
 	return nil
 }
 
-// cleanupIptables removes the iptables rules.
 func (f *FakeTcpInjector) cleanupIptables() {
 	port := fmt.Sprintf("%d", f.connectPort)
 	mark := fmt.Sprintf("0x%x", f.fwMark)
@@ -318,8 +268,7 @@ func runCmd(name string, args ...string) error {
 	return nil
 }
 
-// Start runs the nfqueue packet processing loop (blocks until context is cancelled).
-func (f *FakeTcpInjector) Start() {
+func (f *FakeTcpInjector) Start() error {
 	err := f.nf.RegisterWithErrorFunc(f.ctx,
 		func(a nfqueue.Attribute) int {
 			f.processPacket(a)
@@ -332,25 +281,34 @@ func (f *FakeTcpInjector) Start() {
 	)
 	if err != nil {
 		log.Printf("nfqueue register error: %v", err)
-		return
+		f.injectorOpenErr = err
+		close(f.injectorReady)
+		return nil
 	}
+	close(f.injectorReady)
 	<-f.ctx.Done()
+	return nil
 }
 
-// Close stops the injector and cleans up iptables rules.
+func (f *FakeTcpInjector) WaitInjectorReady() error {
+	<-f.injectorReady
+	return f.injectorOpenErr
+}
+
 func (f *FakeTcpInjector) Close() {
-	f.cancel()
-	if f.nf != nil {
-		f.nf.Close()
-	}
-	if f.rawFd >= 0 {
-		syscall.Close(f.rawFd)
-		f.rawFd = -1
-	}
-	f.cleanupIptables()
+	f.closeOnce.Do(func() {
+		f.cancel()
+		if f.nf != nil {
+			f.nf.Close()
+		}
+		if f.rawFd >= 0 {
+			syscall.Close(f.rawFd)
+			f.rawFd = -1
+		}
+		f.cleanupIptables()
+	})
 }
 
-// sendRawPacket sends a raw IP packet bypassing nfqueue (due to SO_MARK).
 func (f *FakeTcpInjector) sendRawPacket(rawIP []byte) error {
 	dstIP := packet.IPv4DstAddr(rawIP)
 	if dstIP == nil {
@@ -365,7 +323,6 @@ func (f *FakeTcpInjector) sendRawPacket(rawIP []byte) error {
 	return syscall.Sendto(f.rawFd, rawIP, 0, sa)
 }
 
-// processPacket handles a single nfqueue packet.
 func (f *FakeTcpInjector) processPacket(a nfqueue.Attribute) {
 	if a.PacketID == nil {
 		log.Printf("nfqueue: missing packet id (cannot issue verdict)")
@@ -385,7 +342,6 @@ func (f *FakeTcpInjector) processPacket(a nfqueue.Attribute) {
 		return
 	}
 
-	// IPv4 only: do not interpret IPv6 (or non-IP) payloads as IPv4.
 	if packet.IPVersion(payload) != 4 {
 		if err := f.nf.SetVerdict(id, nfqueue.NfAccept); err != nil {
 			log.Printf("nfqueue SetVerdict: %v", err)
@@ -398,46 +354,51 @@ func (f *FakeTcpInjector) processPacket(a nfqueue.Attribute) {
 	srcPort := packet.TCPSrcPort(payload)
 	dstPort := packet.TCPDstPort(payload)
 
-	// Determine direction: if srcIP == our interface IP, it's outbound
-	isOutbound := srcIP == f.interfaceIP
-
-	if isOutbound {
-		cID := connection.ConnID{SrcIP: srcIP, SrcPort: srcPort, DstIP: dstIP, DstPort: dstPort}
-		val, ok := f.Connections.Load(cID)
-		if !ok {
-			f.nf.SetVerdict(id, nfqueue.NfAccept)
-			return
-		}
-		conn := val.(*FakeInjectiveConnection)
-		conn.Mu.Lock()
-		defer conn.Mu.Unlock()
-		if !conn.Monitor {
-			f.nf.SetVerdict(id, nfqueue.NfAccept)
-			return
-		}
-		f.onOutboundPacket(id, payload, conn)
+	conn, outbound, ok := f.lookupConnQuad(srcIP, srcPort, dstIP, dstPort)
+	if !ok {
+		f.nf.SetVerdict(id, nfqueue.NfAccept)
+		return
+	}
+	c := conn
+	c.Mu.Lock()
+	defer c.Mu.Unlock()
+	if !c.Monitor {
+		f.nf.SetVerdict(id, nfqueue.NfAccept)
+		return
+	}
+	if outbound {
+		f.onOutboundPacket(id, payload, c)
 	} else {
-		// Inbound: key is reversed (dst=us, src=remote)
-		cID := connection.ConnID{SrcIP: dstIP, SrcPort: dstPort, DstIP: srcIP, DstPort: srcPort}
-		val, ok := f.Connections.Load(cID)
-		if !ok {
-			f.nf.SetVerdict(id, nfqueue.NfAccept)
-			return
-		}
-		conn := val.(*FakeInjectiveConnection)
-		conn.Mu.Lock()
-		defer conn.Mu.Unlock()
-		if !conn.Monitor {
-			f.nf.SetVerdict(id, nfqueue.NfAccept)
-			return
-		}
-		f.onInboundPacket(id, payload, conn)
+		f.onInboundPacket(id, payload, c)
 	}
 }
 
-// onUnexpectedPacket handles unexpected packets.
+func (f *FakeTcpInjector) lookupConnQuad(srcIP string, srcPort uint16, dstIP string, dstPort uint16) (conn *FakeInjectiveConnection, outbound bool, ok bool) {
+	idOut := connection.ConnID{SrcIP: srcIP, SrcPort: srcPort, DstIP: dstIP, DstPort: dstPort}
+	if v, ok := f.Connections.Load(idOut); ok {
+		return v.(*FakeInjectiveConnection), true, true
+	}
+	idIn := connection.ConnID{SrcIP: dstIP, SrcPort: dstPort, DstIP: srcIP, DstPort: srcPort}
+	if v, ok := f.Connections.Load(idIn); ok {
+		return v.(*FakeInjectiveConnection), false, true
+	}
+	if v, ok := f.byLocalPort.Load(srcPort); ok {
+		c := v.(*FakeInjectiveConnection)
+		if ipv4Equal(dstIP, c.DstIP) && dstPort == c.DstPort {
+			return c, true, true
+		}
+	}
+	if v, ok := f.byLocalPort.Load(dstPort); ok {
+		c := v.(*FakeInjectiveConnection)
+		if ipv4Equal(srcIP, c.DstIP) && srcPort == c.DstPort {
+			return c, false, true
+		}
+	}
+	return nil, false, false
+}
+
 func (f *FakeTcpInjector) onUnexpectedPacket(id uint32, raw []byte, conn *FakeInjectiveConnection, info string) {
-	fmt.Println(info, packet.PacketSummary(raw))
+	log.Printf("injector: %s %s", info, packet.PacketSummary(raw))
 	if conn.Sock != nil {
 		conn.Sock.Close()
 	}
@@ -452,7 +413,6 @@ func (f *FakeTcpInjector) onUnexpectedPacket(id uint32, raw []byte, conn *FakeIn
 	f.nf.SetVerdict(id, nfqueue.NfAccept)
 }
 
-// onInboundPacket processes packets arriving from the remote server.
 func (f *FakeTcpInjector) onInboundPacket(id uint32, raw []byte, conn *FakeInjectiveConnection) {
 	if conn.SynSeq == -1 {
 		f.onUnexpectedPacket(id, raw, conn, "unexpected inbound packet, no syn sent!")
@@ -464,7 +424,6 @@ func (f *FakeTcpInjector) onInboundPacket(id uint32, raw []byte, conn *FakeInjec
 	seqNum := packet.TCPSeqNum(raw)
 	ackNum := packet.TCPAckNum(raw)
 
-	// SYN-ACK from server
 	if flags.ACK && flags.SYN && !flags.RST && !flags.FIN && payloadLen == 0 {
 		if conn.SynAckSeq != -1 && conn.SynAckSeq != int64(seqNum) {
 			f.onUnexpectedPacket(id, raw, conn,
@@ -482,22 +441,21 @@ func (f *FakeTcpInjector) onInboundPacket(id uint32, raw []byte, conn *FakeInjec
 		return
 	}
 
-	// Pure ACK after fake data sent
-	if flags.ACK && !flags.SYN && !flags.RST && !flags.FIN && payloadLen == 0 && conn.FakeSent {
-		expectedSeq := uint32((uint32(conn.SynAckSeq) + 1) & 0xffffffff)
-		if conn.SynAckSeq == -1 || expectedSeq != seqNum {
+	if flags.ACK && !flags.SYN && !flags.RST && conn.FakeInjectInProgress.Load() && !conn.FakeSent.Load() {
+		conn.PostFakeAckObserved.Store(true)
+		f.nf.SetVerdict(id, nfqueue.NfAccept)
+		return
+	}
+
+	// CDNs differ on seq/ack fields after the wrong-seq fake; accept a strict match or a peer ACK.
+	if flags.ACK && !flags.SYN && !flags.RST && conn.FakeSent.Load() && conn.SynAckSeq != -1 {
+		strict := postFakeInboundStrictOK(seqNum, ackNum, conn)
+		if !strict && !postFakeInboundPermissiveOK(flags) {
 			f.onUnexpectedPacket(id, raw, conn,
-				fmt.Sprintf("unexpected inbound ack, seq not matched! %d %d", seqNum, conn.SynAckSeq))
-			return
-		}
-		expectedAck := uint32((uint32(conn.SynSeq) + 1) & 0xffffffff)
-		if ackNum != expectedAck {
-			f.onUnexpectedPacket(id, raw, conn,
-				fmt.Sprintf("unexpected inbound ack, ack not matched! %d %d", ackNum, conn.SynSeq))
+				fmt.Sprintf("unexpected inbound after fake seq=%d ack=%d synAck=%d syn=%d strict=%v", seqNum, ackNum, conn.SynAckSeq, conn.SynSeq, strict))
 			return
 		}
 		conn.Monitor = false
-		// Accept this packet so the kernel TCP stack sees it
 		f.nf.SetVerdict(id, nfqueue.NfAccept)
 		select {
 		case conn.T2aChan <- "fake_data_ack_recv":
@@ -509,10 +467,13 @@ func (f *FakeTcpInjector) onInboundPacket(id uint32, raw []byte, conn *FakeInjec
 	f.onUnexpectedPacket(id, raw, conn, "unexpected inbound packet")
 }
 
-// onOutboundPacket processes packets going to the remote server.
 func (f *FakeTcpInjector) onOutboundPacket(id uint32, raw []byte, conn *FakeInjectiveConnection) {
-	if conn.SchFakeSent {
-		f.onUnexpectedPacket(id, raw, conn, "unexpected outbound packet after fake sent!")
+	if conn.FakeSent.Load() {
+		f.nf.SetVerdict(id, nfqueue.NfAccept)
+		return
+	}
+	if conn.FakeInjectInProgress.Load() {
+		f.nf.SetVerdict(id, nfqueue.NfAccept)
 		return
 	}
 
@@ -521,7 +482,6 @@ func (f *FakeTcpInjector) onOutboundPacket(id uint32, raw []byte, conn *FakeInje
 	seqNum := packet.TCPSeqNum(raw)
 	ackNum := packet.TCPAckNum(raw)
 
-	// SYN packet
 	if flags.SYN && !flags.ACK && !flags.RST && !flags.FIN && payloadLen == 0 {
 		if ackNum != 0 {
 			f.onUnexpectedPacket(id, raw, conn, "unexpected outbound syn, ack_num is not zero!")
@@ -537,7 +497,6 @@ func (f *FakeTcpInjector) onOutboundPacket(id uint32, raw []byte, conn *FakeInje
 		return
 	}
 
-	// ACK packet completing handshake
 	if flags.ACK && !flags.SYN && !flags.RST && !flags.FIN && payloadLen == 0 {
 		expectedSeq := uint32((uint32(conn.SynSeq) + 1) & 0xffffffff)
 		if conn.SynSeq == -1 || expectedSeq != seqNum {
@@ -551,36 +510,38 @@ func (f *FakeTcpInjector) onOutboundPacket(id uint32, raw []byte, conn *FakeInje
 				fmt.Sprintf("unexpected outbound ack, ack not matched! %d %d", ackNum, conn.SynAckSeq))
 			return
 		}
-		// Accept the ACK first
+		// Accept the ACK first, then inject off the nfqueue callback (same idea as Windows async injection).
 		f.nf.SetVerdict(id, nfqueue.NfAccept)
-		conn.SchFakeSent = true
 
-		// Clone raw bytes for the injection goroutine
 		rawCopy := make([]byte, len(raw))
 		copy(rawCopy, raw)
-		go f.fakeSendThread(rawCopy, conn)
+		conn.FakeInjectInProgress.Store(true)
+		go f.runFakeInjectionLocked(rawCopy, conn)
 		return
 	}
 
 	f.onUnexpectedPacket(id, raw, conn, "unexpected outbound packet")
 }
 
-// fakeSendThread injects the fake ClientHello via raw socket.
-func (f *FakeTcpInjector) fakeSendThread(rawCopy []byte, conn *FakeInjectiveConnection) {
-	conn.Mu.Lock()
-	defer conn.Mu.Unlock()
+// runFakeInjectionLocked injects the fake ClientHello via raw socket on a dedicated goroutine.
+// It does not hold conn.Mu during inject/sleep so nfqueue can still process inbound ACKs (FakeInjectInProgress path).
+func (f *FakeTcpInjector) runFakeInjectionLocked(rawCopy []byte, conn *FakeInjectiveConnection) {
+	defer conn.FakeInjectInProgress.Store(false)
 
 	time.Sleep(1 * time.Millisecond)
 
+	conn.Mu.Lock()
 	if !conn.Monitor {
+		conn.Mu.Unlock()
 		return
 	}
-
 	if conn.BypassMethod != "wrong_seq" {
 		log.Printf("not implemented bypass method: %s", conn.BypassMethod)
 		conn.AbortUnexpectedCloseLocked()
+		conn.Mu.Unlock()
 		return
 	}
+	conn.Mu.Unlock()
 
 	repeat := conn.FakeRepeat
 	if repeat < 1 {
@@ -593,131 +554,45 @@ func (f *FakeTcpInjector) fakeSendThread(rawCopy []byte, conn *FakeInjectiveConn
 		segPerInject = 1
 	}
 	for i := 0; i < repeat; i++ {
-		if err := f.injectWrongSeqClientHello(rawCopy, conn); err != nil {
+		if !conn.IsMonitoring() {
+			return
+		}
+		if err := injectWrongSeqClientHello(f.nicMTU, rawCopy, conn, conn.IsMonitoring, f.sendRawPacket); err != nil {
+			if err == errInjectionCanceled {
+				return
+			}
 			log.Printf("inject fake ClientHello: %v", err)
+			conn.Mu.Lock()
 			conn.AbortUnexpectedCloseLocked()
+			conn.Mu.Unlock()
 			return
 		}
 		log.Printf("injector: fake TLS ClientHello %d/%d sent (%d bytes, %d TCP segment(s), MSS=%d)",
 			i+1, repeat, total, segPerInject, mss)
-		if i+1 < repeat {
-			time.Sleep(2 * time.Millisecond)
+		if i+1 < repeat && conn.FakeDelay > 0 && !sleepWhileContinue(conn.FakeDelay, conn.IsMonitoring) {
+			return
 		}
 	}
-	conn.FakeSent = true
+	conn.FakeSent.Store(true)
+	if conn.PostFakeAckObserved.Load() {
+		conn.Mu.Lock()
+		if conn.Monitor {
+			conn.Monitor = false
+			select {
+			case conn.T2aChan <- "fake_data_ack_recv":
+			default:
+			}
+		}
+		conn.Mu.Unlock()
+	}
 }
 
-// injectWrongSeqClientHello sends one or more TCP segments for conn.FakeData using
-// wrong-seq semantics. Large TLS ClientHellos are split so each IP packet fits the MTU.
-func (f *FakeTcpInjector) injectWrongSeqClientHello(template []byte, conn *FakeInjectiveConnection) error {
-	payload := conn.FakeData
-	total := len(payload)
-	if total == 0 {
-		return fmt.Errorf("empty FakeData")
-	}
-
-	baseWrongSeq := (uint32(conn.SynSeq) + 1 - uint32(total)) & 0xffffffff
-	baseIdent := uint16(0)
-	if packet.IPVersion(template) == 4 {
-		baseIdent = packet.IPv4Ident(template)
-	}
-
-	mss := segmentMSS(f.nicMTU, template)
-	chunkIdx := 0
-	for off := 0; off < total; off += mss {
-		end := off + mss
-		if end > total {
-			end = total
-		}
-		chunk := payload[off:end]
-		isLast := end == total
-
-		pkt := packet.SetTCPPayload(template, chunk)
-		if pkt == nil {
-			return fmt.Errorf("SetTCPPayload: invalid TCP/IP packet")
-		}
-		packet.SetTCPSeqNum(pkt, baseWrongSeq+uint32(off))
-		if isLast {
-			packet.SetTCPFlag(pkt, "psh", true)
-		} else {
-			packet.SetTCPFlag(pkt, "psh", false)
-		}
-		if packet.IPVersion(pkt) == 4 {
-			packet.SetIPv4Ident(pkt, (baseIdent+1+uint16(chunkIdx))&0xffff)
-			packet.ClearIPv4DontFragment(pkt)
-		}
-		chunkIdx++
-
-		computeIPChecksum(pkt)
-		computeTCPChecksum(pkt)
-		if err := f.sendRawPacket(pkt); err != nil {
-			return err
-		}
-	}
-	return nil
+func (f *FakeTcpInjector) RegisterConn(conn *FakeInjectiveConnection) {
+	f.Connections.Store(conn.ID, conn)
+	f.byLocalPort.Store(conn.SrcPort, conn)
 }
 
-// computeIPChecksum calculates and sets the IPv4 header checksum.
-func computeIPChecksum(raw []byte) {
-	ipHdrLen := packet.IPHeaderLen(raw)
-	if ipHdrLen < 20 || len(raw) < ipHdrLen {
-		return
-	}
-	// Zero out existing checksum
-	raw[10] = 0
-	raw[11] = 0
-	sum := checksumData(raw[:ipHdrLen])
-	binary.BigEndian.PutUint16(raw[10:12], sum)
-}
-
-// computeTCPChecksum calculates and sets the TCP checksum using the pseudo-header.
-func computeTCPChecksum(raw []byte) {
-	ipHdrLen := packet.IPHeaderLen(raw)
-	if ipHdrLen < 20 || len(raw) < ipHdrLen+20 {
-		return
-	}
-	srcIP := net.IP(raw[12:16]).To4()
-	dstIP := net.IP(raw[16:20]).To4()
-	if srcIP == nil || dstIP == nil {
-		return
-	}
-	tcpSegment := raw[ipHdrLen:]
-	if len(tcpSegment) < 20 {
-		return
-	}
-	tcpLen := len(tcpSegment)
-
-	// Zero out existing TCP checksum (at offset 16-17 of TCP header)
-	tcpSegment[16] = 0
-	tcpSegment[17] = 0
-
-	// Build pseudo-header: srcIP(4) + dstIP(4) + zero(1) + proto(1) + tcpLen(2)
-	pseudo := make([]byte, 12)
-	copy(pseudo[0:4], srcIP)
-	copy(pseudo[4:8], dstIP)
-	pseudo[8] = 0
-	pseudo[9] = 6 // TCP
-	binary.BigEndian.PutUint16(pseudo[10:12], uint16(tcpLen))
-
-	data := make([]byte, 0, len(pseudo)+tcpLen)
-	data = append(data, pseudo...)
-	data = append(data, tcpSegment...)
-
-	sum := checksumData(data)
-	binary.BigEndian.PutUint16(tcpSegment[16:18], sum)
-}
-
-// checksumData computes the internet checksum (RFC 1071).
-func checksumData(data []byte) uint16 {
-	var sum uint32
-	for i := 0; i < len(data)-1; i += 2 {
-		sum += uint32(binary.BigEndian.Uint16(data[i : i+2]))
-	}
-	if len(data)%2 == 1 {
-		sum += uint32(data[len(data)-1]) << 8
-	}
-	for sum > 0xffff {
-		sum = (sum >> 16) + (sum & 0xffff)
-	}
-	return ^uint16(sum)
+func (f *FakeTcpInjector) UnregisterConn(conn *FakeInjectiveConnection) {
+	f.Connections.Delete(conn.ID)
+	f.byLocalPort.Delete(conn.SrcPort)
 }

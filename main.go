@@ -22,6 +22,8 @@ import (
 	"sni-spoofing-go/packet"
 )
 
+const firstClientHelloTimeout = 10 * time.Second
+
 func usage() {
 	exe := os.Args[0]
 	w := os.Stderr
@@ -29,15 +31,18 @@ func usage() {
 	fmt.Fprintf(w, "Usage:\n")
 	fmt.Fprintf(w, "  %s -listen <addr> -connect <addr> [options]\n\n", exe)
 	fmt.Fprintf(w, "Required:\n")
-	fmt.Fprintf(w, "  -listen <host:port>   proxy listen address (host may be omitted, e.g. :8080)\n")
-	fmt.Fprintf(w, "  -connect <host:port>  upstream; hostname (SNI defaults to host) or IPv4 (-fake-sni required)\n\n")
+	fmt.Fprintf(w, "  -listen <host:port>   listen address (host optional, e.g. :8080)\n")
+	fmt.Fprintf(w, "  -connect <host:port>  upstream; hostname (SNI from host) or IPv4 (needs -fake-sni)\n\n")
 	fmt.Fprintf(w, "Optional:\n")
-	fmt.Fprintf(w, "  -fake-sni <hostname>  injected ClientHello SNI (overrides hostname from -connect)\n")
-	fmt.Fprintf(w, "  -fake-repeat <n>      how many times to inject fake ClientHello (default 1)\n")
-	fmt.Fprintf(w, "  -utls <name>          TLS fingerprint (default: chrome); see list below\n")
-	fmt.Fprintf(w, "  -fragment             split real ClientHello: prefix, SNI chunks, suffix (default true)\n")
-	fmt.Fprintf(w, "  -fragment-delay       delay between writes (default 500ms)\n")
-	fmt.Fprintf(w, "  -sni-chunk            SNI hostname bytes per write after prefix (default 3; 0 = whole hostname in one write)\n\n")
+	fmt.Fprintf(w, "  -fake-sni <hostname>  SNI in the injected ClientHello (overrides -connect hostname)\n")
+	fmt.Fprintf(w, "  -fake-repeat <n>      fake ClientHello injections before real traffic (default 1)\n")
+	fmt.Fprintf(w, "  -fake-delay          delay after fake injection (default 2ms)\n")
+	fmt.Fprintf(w, "  -ack-timeout         max wait for server ACK after fake injection (default 2s)\n")
+	fmt.Fprintf(w, "  -utls <name>         TLS fingerprint (default: chrome); list below\n")
+	fmt.Fprintf(w, "  -enable-fragment     fragment real ClientHello (prefix / SNI chunks / suffix); default false\n")
+	fmt.Fprintf(w, "  -fragment-delay      delay between TCP segments when ClientHello is split (default 500ms)\n")
+	fmt.Fprintf(w, "  -sni-chunk            SNI bytes per TCP write after prefix (default 3; 0 = whole name in one write)\n")
+	fmt.Fprintf(w, "\n")
 	fmt.Fprintf(w, "Examples:\n")
 	fmt.Fprintf(w, "  %s -listen 127.0.0.1:8080 -connect example.com:443\n", exe)
 	fmt.Fprintf(w, "  %s -listen 127.0.0.1:8080 -connect 198.51.100.2:443 -fake-sni allowed.example.com\n\n", exe)
@@ -51,18 +56,22 @@ func usage() {
 func main() {
 	flag.Usage = usage
 	var optListen, optConnect, optFakeSNI, optUTLS string
-	var fragment bool
+	var enableFragment bool
 	var fragmentDelay time.Duration
 	var sniChunk int
 	var fakeRepeat int
+	var ackTimeout time.Duration
+	var fakeDelay time.Duration
 	flag.StringVar(&optListen, "listen", "", "listen address host:port (required)")
 	flag.StringVar(&optConnect, "connect", "", "upstream host:port (required)")
 	flag.StringVar(&optFakeSNI, "fake-sni", "", "injected ClientHello SNI (optional if -connect uses a hostname)")
 	flag.IntVar(&fakeRepeat, "fake-repeat", 1, "number of wrong-seq fake ClientHello injections before real traffic")
+	flag.DurationVar(&fakeDelay, "fake-delay", 2*time.Millisecond, "delay after fake injection (0 = none)")
 	flag.StringVar(&optUTLS, "utls", "", "TLS fingerprint preset (see usage above; e.g. chrome_120, firefox)")
-	flag.BoolVar(&fragment, "fragment", true, "after fake SNI, read real ClientHello: send prefix, then SNI chunks, then suffix")
-	flag.DurationVar(&fragmentDelay, "fragment-delay", 500*time.Millisecond, "delay between ClientHello segment writes")
+	flag.BoolVar(&enableFragment, "enable-fragment", false, "after fake SNI, read real ClientHello: send prefix, then SNI chunks, then suffix")
+	flag.DurationVar(&fragmentDelay, "fragment-delay", 500*time.Millisecond, "delay between TCP segments when fake or real ClientHello is split (MSS / chunking)")
 	flag.IntVar(&sniChunk, "sni-chunk", packet.DefaultSNIChunkBytes, "SNI hostname bytes per TCP write (0 = entire hostname in one write)")
+	flag.DurationVar(&ackTimeout, "ack-timeout", 2*time.Second, "timeout waiting for server ACK after fake injection")
 	flag.Parse()
 
 	cliListen, cliConnect := false, false
@@ -79,7 +88,8 @@ func main() {
 
 	args := flag.Args()
 	if len(args) > 0 {
-		fmt.Fprintf(os.Stderr, "error: unexpected arguments: %q\n\n", args)
+		fmt.Fprintf(os.Stderr, "error: unexpected arguments: %q\n", args)
+		fmt.Fprintln(os.Stderr)
 		usage()
 		os.Exit(2)
 	}
@@ -91,6 +101,9 @@ func main() {
 	}
 	if sniChunk < 0 {
 		log.Fatal("-sni-chunk must be >= 0 (0 = whole hostname in one write)")
+	}
+	if ackTimeout <= 0 {
+		log.Fatal("-ack-timeout must be positive (e.g. 2s, 5s, 1m)")
 	}
 
 	cfg, err := config.ConnectFromCLI(optListen, optConnect, fakeSNIArg)
@@ -106,9 +119,11 @@ func main() {
 		log.Fatal("Invalid -utls: ", err)
 	}
 
-	fakeSNI := []byte(cfg.FakeSNI)
 	if !network.IsIPv4(cfg.ConnectIP) {
 		log.Fatalf("upstream must resolve to IPv4 (IPv6 is not supported): %q", cfg.ConnectIP)
+	}
+	if len(cfg.ConnectIPv4s) == 0 {
+		log.Fatal("internal error: no ConnectIPv4s after resolve")
 	}
 	if cfg.ListenHost != "" && !network.IsIPv4(cfg.ListenHost) {
 		log.Fatalf("LISTEN host must be IPv4 or empty (IPv6 is not supported): %q", cfg.ListenHost)
@@ -119,7 +134,7 @@ func main() {
 	}
 	fmt.Printf("Local interface: %s\n", interfaceIPv4)
 
-	fakeInjector, err := injection.NewFakeTcpInjector(interfaceIPv4, cfg.ConnectIP, uint16(cfg.ConnectPort))
+	fakeInjector, err := injection.NewFakeTcpInjector(interfaceIPv4, cfg.ConnectIPv4s, uint16(cfg.ConnectPort))
 	if err != nil {
 		log.Fatal("Failed to create injector: ", err)
 	}
@@ -133,11 +148,22 @@ func main() {
 		os.Exit(0)
 	}()
 
-	go fakeInjector.Start()
+	go func() {
+		if err := fakeInjector.Start(); err != nil {
+			log.Printf("injector: %v", err)
+			fakeInjector.Close()
+			os.Exit(1)
+		}
+	}()
+	if err := fakeInjector.WaitInjectorReady(); err != nil {
+		fakeInjector.Close()
+		log.Fatal("injector: ", err)
+	}
 
 	listenAddr := net.JoinHostPort(cfg.ListenHost, strconv.Itoa(cfg.ListenPort))
 	listener, err := net.Listen("tcp4", listenAddr)
 	if err != nil {
+		fakeInjector.Close()
 		log.Fatal("Failed to listen: ", err)
 	}
 	defer listener.Close()
@@ -155,7 +181,7 @@ func main() {
 			tc.SetKeepAlivePeriod(11 * time.Second)
 		}
 
-		go handleConnection(incomingSock, cfg, interfaceIPv4, fakeSNI, clientHelloID, fakeInjector, fakeRepeat, fragment, fragmentDelay, sniChunk)
+		go handleConnection(incomingSock, cfg, interfaceIPv4, cfg.FakeSNI, clientHelloID, fakeInjector, fakeRepeat, fakeDelay, enableFragment, fragmentDelay, sniChunk, ackTimeout)
 	}
 }
 
@@ -163,13 +189,15 @@ func handleConnection(
 	incomingSock net.Conn,
 	cfg *config.Config,
 	interfaceIPv4 string,
-	fakeSNI []byte,
+	fakeSNI string,
 	clientHelloID utls.ClientHelloID,
 	fakeInjector *injection.FakeTcpInjector,
 	fakeRepeat int,
-	fragment bool,
+	fakeDelay time.Duration,
+	enableFragment bool,
 	fragmentDelay time.Duration,
 	sniChunk int,
+	ackTimeout time.Duration,
 ) {
 	defer func() {
 		if r := recover(); r != nil {
@@ -177,16 +205,16 @@ func handleConnection(
 		}
 	}()
 
-	fakeData, err := packet.BuildClientHelloRecord(string(fakeSNI), clientHelloID)
+	fakeData, err := packet.BuildClientHelloRecord(fakeSNI, clientHelloID)
 	if err != nil {
 		log.Printf("ClientHello: %v", err)
 		incomingSock.Close()
 		return
 	}
 
-	outgoingSock, conn, srcPort, err := dialOutgoing(
+	outgoingSock, conn, _, err := dialOutgoing(
 		interfaceIPv4, cfg.ConnectIP, cfg.ConnectPort,
-		fakeData, "wrong_seq", fakeRepeat, incomingSock, fakeInjector,
+		fakeData, "wrong_seq", fakeRepeat, fakeDelay, fragmentDelay, incomingSock, fakeInjector,
 	)
 	if err != nil {
 		log.Printf("Failed to connect to %s:%d: %v", cfg.ConnectIP, cfg.ConnectPort, err)
@@ -203,68 +231,74 @@ func handleConnection(
 		tc.SetKeepAlivePeriod(11 * time.Second)
 	}
 
-	key := injection.ConnID{
-		SrcIP: interfaceIPv4, SrcPort: srcPort,
-		DstIP: cfg.ConnectIP, DstPort: uint16(cfg.ConnectPort),
-	}
-
 	select {
 	case msg := <-conn.T2aChan:
 		if msg == "unexpected_close" {
-			conn.Mu.Lock()
-			conn.Monitor = false
-			conn.Mu.Unlock()
-			fakeInjector.Connections.Delete(key)
-			outgoingSock.Close()
-			incomingSock.Close()
+			log.Printf("proxy: injector aborted handshake (unexpected TCP); closing client connection")
+			stopMonitoring(fakeInjector, conn)
+			closePair(outgoingSock, incomingSock)
 			return
 		}
 		if msg != "fake_data_ack_recv" {
 			log.Printf("unexpected t2a msg: %q", msg)
-			conn.Mu.Lock()
-			conn.Monitor = false
-			conn.Mu.Unlock()
-			fakeInjector.Connections.Delete(key)
-			outgoingSock.Close()
-			incomingSock.Close()
+			stopMonitoring(fakeInjector, conn)
+			closePair(outgoingSock, incomingSock)
 			return
 		}
-	case <-time.After(2 * time.Second):
-		conn.Mu.Lock()
-		conn.Monitor = false
-		conn.Mu.Unlock()
-		fakeInjector.Connections.Delete(key)
-		outgoingSock.Close()
-		incomingSock.Close()
+	case <-time.After(ackTimeout):
+		log.Printf("proxy: timed out after %v waiting for post-injection ACK (injector path); closing client connection", ackTimeout)
+		stopMonitoring(fakeInjector, conn)
+		closePair(outgoingSock, incomingSock)
 		return
 	}
 
-	conn.Mu.Lock()
-	conn.Monitor = false
-	conn.Mu.Unlock()
-	fakeInjector.Connections.Delete(key)
+	stopMonitoring(fakeInjector, conn)
 
-	if fragment {
-		if err := forwardFragmentedClientHello(incomingSock, outgoingSock, fragmentDelay, sniChunk); err != nil {
+	if fakeDelay > 0 {
+		time.Sleep(fakeDelay)
+	}
+
+	if enableFragment {
+		if err := forwardFragmentedClientHello(incomingSock, outgoingSock, fragmentDelay, sniChunk, true); err != nil {
 			log.Printf("ClientHello fragment: %v", err)
-			outgoingSock.Close()
-			incomingSock.Close()
+			closePair(outgoingSock, incomingSock)
 			return
 		}
 	}
 
 	done := make(chan struct{}, 2)
-	go func() { defer func() { done <- struct{}{} }(); relay(outgoingSock, incomingSock) }()
-	go func() { defer func() { done <- struct{}{} }(); relay(incomingSock, outgoingSock) }()
+	go func() {
+		defer func() { done <- struct{}{} }()
+		relay(outgoingSock, incomingSock)
+	}()
+	go func() {
+		defer func() { done <- struct{}{} }()
+		relay(incomingSock, outgoingSock)
+	}()
 
 	<-done
-	outgoingSock.Close()
-	incomingSock.Close()
+	closePair(outgoingSock, incomingSock)
 	<-done
 }
 
-func forwardFragmentedClientHello(incoming, outgoing net.Conn, delay time.Duration, sniChunkBytes int) error {
+func stopMonitoring(fakeInjector *injection.FakeTcpInjector, conn *injection.FakeInjectiveConnection) {
+	conn.Mu.Lock()
+	conn.Monitor = false
+	conn.Mu.Unlock()
+	fakeInjector.UnregisterConn(conn)
+}
+
+func closePair(a, b net.Conn) {
+	a.Close()
+	b.Close()
+}
+
+func forwardFragmentedClientHello(incoming, outgoing net.Conn, delay time.Duration, sniChunkBytes int, logEachFragment bool) error {
+	if err := incoming.SetReadDeadline(time.Now().Add(firstClientHelloTimeout)); err != nil {
+		return err
+	}
 	rec, err := packet.ReadFirstTLSRecord(incoming)
+	_ = incoming.SetReadDeadline(time.Time{})
 	if err != nil {
 		return err
 	}
@@ -273,10 +307,11 @@ func forwardFragmentedClientHello(incoming, outgoing net.Conn, delay time.Durati
 	if tc, ok := outgoing.(*net.TCPConn); ok {
 		tcpFrag = tc
 	}
-	return packet.WriteClientHelloFragments(outgoing, frags, delay, tcpFrag)
+	return packet.WriteClientHelloFragments(outgoing, frags, delay, tcpFrag, logEachFragment)
 }
 
 func relay(dst, src net.Conn) {
-	buf := make([]byte, 65575)
+	const bufSize = 65575
+	buf := make([]byte, bufSize)
 	_, _ = io.CopyBuffer(dst, src, buf)
 }

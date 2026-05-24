@@ -1,18 +1,18 @@
 # SNI-Spoofing-Go
 
-A high-performance **Go implementation** of the [SNI-Spoofing](https://github.com/patterniha/SNI-Spoofing) DPI bypass tool, originally written in Python by [@patterniha](https://github.com/patterniha).
+A **Go implementation** of the [SNI-Spoofing](https://github.com/patterniha/SNI-Spoofing) DPI bypass tool, originally written in Python by [@patterniha](https://github.com/patterniha).
 
-Cross-platform: **Windows** (WinDivert) and **Linux/OpenWrt** (nfqueue + raw socket).
+Cross-platform: **Windows** with WinDivert and **Linux/OpenWrt** with nfqueue plus a raw socket.
 
 ## Credits & Acknowledgments
 
 This project is a complete port of the original **[SNI-Spoofing](https://github.com/patterniha/SNI-Spoofing)** by **[@patterniha](https://github.com/patterniha)**. All credit for the original concept, algorithm, and DPI bypass technique goes to them.
 
-This Go version maintains full compatibility with the original Python logic while adding:
+This Go version follows the original wrong-sequence fake ClientHello technique while adding:
 
 - Native concurrency with goroutines
-- Cross-compilation to any OS/architecture with a single command
-- Single static binary — no Python interpreter or pip dependencies needed
+- Cross-compilation for Windows and Linux targets
+- Single static binary; no Python interpreter or pip dependencies
 - Linux/OpenWrt support via nfqueue (the original is Windows-only)
 
 ## How it works
@@ -27,12 +27,10 @@ This tool acts as a local TCP proxy that:
 
 ## Platform Support
 
-
 | Platform          | Packet Interception | Fake Injection | Requirements                                |
 | ----------------- | ------------------- | -------------- | ------------------------------------------- |
-| **Windows**       | WinDivert driver    | WinDivert send | `WinDivert.dll` + `WinDivert64.sys`         |
+| **Windows**       | WinDivert driver    | WinDivert send | Run as Administrator; driver is embedded    |
 | **Linux/OpenWrt** | nfqueue (netfilter) | Raw socket     | `iptables`, `nfnetlink_queue` kernel module |
-
 
 ## Quick Start
 
@@ -48,22 +46,34 @@ make dist
 make linux-amd64
 make linux-arm64
 make windows
-
-# windows + WinDivert runtime next to exe
-make windows-bundle
 ```
+
+The Windows binary embeds the WinDivert driver through the local `godivert` module. You do not need to ship `WinDivert.dll` or `WinDivert64.sys` beside `sni-spoofing.exe`.
 
 ### Run
 
-Configuration is **CLI flags only**: `-listen` and `-connect` are required; `-fake-sni` is optional when `-connect` uses a hostname (SNI defaults to that hostname). See `-h` for `-utls` presets.
+Configuration is **CLI flags only**. `-listen` and `-connect` are required. `-fake-sni` is optional when `-connect` uses a hostname; otherwise it is required because the connect target is only an IP address.
 
 ```bash
-# Windows (as Administrator) — put WinDivert.dll, WinDivert64.sys next to the exe
+# Windows (as Administrator)
 .\sni-spoofing.exe -listen 127.0.0.1:40443 -connect 188.114.98.0:443 -fake-sni auth.vercel.com
 
 # Linux/OpenWrt (as root)
 sudo ./sni-spoofing-linux-amd64 -listen 127.0.0.1:40443 -connect 188.114.98.0:443 -fake-sni auth.vercel.com
 ```
+
+Useful options:
+
+| Flag | Default | Meaning |
+| ---- | ------- | ------- |
+| `-fake-sni` | hostname from `-connect` | Decoy SNI used in the injected fake ClientHello |
+| `-fake-repeat` | `1` | Number of fake ClientHello injections |
+| `-fake-delay` | `2ms` | Delay after fake injection before forwarding real traffic |
+| `-ack-timeout` | `2s` | Max wait for the server response after fake injection |
+| `-utls` | `chrome` | TLS fingerprint preset; run with `-h` to list all presets |
+| `-enable-fragment` | disabled | Split the real ClientHello after fake injection |
+| `-fragment-delay` | `500ms` | Delay between split real ClientHello writes |
+| `-sni-chunk` | `3` | SNI bytes per write when `-enable-fragment` is set; `0` means the whole hostname |
 
 ### Docker (prebuilt image)
 
@@ -104,11 +114,11 @@ podman run --rm -it \
 
 ### Test (Cloudflare example)
 
-This is a plain TCP proxy (not an HTTP proxy).
+This is a plain TCP proxy. It is not a SOCKS or HTTP proxy.
 
 To make this method work in practice you usually need:
 
-- A **working upstream IP** you can reach on `:443` (set via `-connect IP:443`). In general this should be an IP that actually serves TLS for the hostname you’re testing, but depending on the network/DPI you may need to experiment.
+- A **working upstream IP** you can reach on `:443` (set via `-connect IP:443`). In general this should be an IP that actually serves TLS for the hostname you are testing, but depending on the network/DPI you may need to experiment.
 - A **working decoy SNI** (set via `-fake-sni`) that your DPI allows. This depends on your network/DPI and may require experimentation.
 
 Remember: the **real target SNI** comes from the client request (`Host`/URL), while `-fake-sni` is the **decoy SNI** that the DPI is intended to see.
@@ -155,4 +165,3 @@ See [LICENSE](LICENSE) for details.
 - **Author:** [@patterniha](https://github.com/patterniha)
 - **Language:** Python
 - **License:** GPL-3.0
-

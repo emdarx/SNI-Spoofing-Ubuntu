@@ -6,14 +6,7 @@ LDFLAGS := -s -w
 CGO_ENABLED := 0
 DIST ?= dist
 
-# WinDivert official release (basil00/WinDivert) — x64 DLL + sys copied into $(DIST)
-WINDIVERT_VERSION ?= 2.2.2
-WINDIVERT_ZIP = WinDivert-$(WINDIVERT_VERSION)-A.zip
-WINDIVERT_EXTRACT = WinDivert-$(WINDIVERT_VERSION)-A
-WINDIVERT_URL = https://github.com/basil00/WinDivert/releases/download/v$(WINDIVERT_VERSION)/$(WINDIVERT_ZIP)
-WINDIVERT_CACHE ?= $(CURDIR)/.cache/windivert
-
-.PHONY: help all dist clean mod test build windivert windows-bundle \
+.PHONY: help all dist clean mod test build \
 	windows linux-amd64 linux-arm64 linux-armv7 linux-mipsle linux-mips
 
 # Default: show targets (run `make build` for local binary)
@@ -32,8 +25,6 @@ help:
 	@echo "  make linux-mips     (GOMIPS=softfloat)"
 	@echo "  make test           go test ./..."
 	@echo "  make mod            go mod download"
-	@echo "  make windivert      fetch WinDivert x64 DLL/sys into $(DIST)/"
-	@echo "  make windows-bundle windows + windivert for $(DIST)/"
 	@echo "  make clean          remove $(DIST)/ and ./sni-spoofing"
 
 mod:
@@ -50,29 +41,6 @@ windows:
 	@mkdir -p $(DIST)
 	CGO_ENABLED=$(CGO_ENABLED) GOOS=windows GOARCH=amd64 \
 		go build -ldflags "$(LDFLAGS)" -o $(DIST)/sni-spoofing.exe .
-
-# WinDivert runtime for Windows amd64 (official GitHub release; not committed — see .gitignore)
-windivert:
-	@set -e; \
-	mkdir -p "$(WINDIVERT_CACHE)" "$(DIST)"; \
-	if [ ! -f "$(WINDIVERT_CACHE)/$(WINDIVERT_ZIP)" ]; then \
-		echo "Downloading $(WINDIVERT_URL)"; \
-		if command -v curl >/dev/null 2>&1; then \
-			curl -fsSL -o "$(WINDIVERT_CACHE)/$(WINDIVERT_ZIP)" "$(WINDIVERT_URL)"; \
-		elif command -v wget >/dev/null 2>&1; then \
-			wget -q -O "$(WINDIVERT_CACHE)/$(WINDIVERT_ZIP)" "$(WINDIVERT_URL)"; \
-		else \
-			echo "windivert: need curl or wget" >&2; exit 1; \
-		fi; \
-	fi; \
-	rm -rf "$(WINDIVERT_CACHE)/$(WINDIVERT_EXTRACT)"; \
-	unzip -q -o "$(WINDIVERT_CACHE)/$(WINDIVERT_ZIP)" -d "$(WINDIVERT_CACHE)"; \
-	cp "$(WINDIVERT_CACHE)/$(WINDIVERT_EXTRACT)/x64/WinDivert.dll" "$(DIST)/"; \
-	cp "$(WINDIVERT_CACHE)/$(WINDIVERT_EXTRACT)/x64/WinDivert64.sys" "$(DIST)/"; \
-	echo "WinDivert $(WINDIVERT_VERSION) x64: WinDivert.dll + WinDivert64.sys -> $(DIST)/"
-
-windows-bundle: windows windivert
-	@echo "Windows bundle: $(DIST)/sni-spoofing.exe + WinDivert.dll + WinDivert64.sys"
 
 linux-amd64:
 	@mkdir -p $(DIST)

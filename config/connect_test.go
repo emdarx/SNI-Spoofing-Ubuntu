@@ -16,6 +16,9 @@ func TestConnectFromCLI_hostnameDefaultSNI(t *testing.T) {
 	if cfg.ConnectIP != "127.0.0.1" {
 		t.Fatalf("ConnectIP = %q", cfg.ConnectIP)
 	}
+	if len(cfg.ConnectIPv4s) != 1 || cfg.ConnectIPv4s[0] != "127.0.0.1" {
+		t.Fatalf("ConnectIPv4s = %v", cfg.ConnectIPv4s)
+	}
 }
 
 func TestConnectFromCLI_hostnameFakeSNIOverride(t *testing.T) {
@@ -45,5 +48,8 @@ func TestConnectFromCLI_IPWithFakeSNI(t *testing.T) {
 	}
 	if cfg.FakeSNI != "allowed.example.com" || cfg.ConnectIP != "198.51.100.2" {
 		t.Fatalf("cfg = %+v", cfg)
+	}
+	if len(cfg.ConnectIPv4s) != 1 || cfg.ConnectIPv4s[0] != "198.51.100.2" {
+		t.Fatalf("ConnectIPv4s = %v", cfg.ConnectIPv4s)
 	}
 }

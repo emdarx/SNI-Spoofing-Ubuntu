@@ -41,6 +41,7 @@ func ConnectFromCLI(listenAddr, connectAddr, fakeSNIOverride string) (*Config, e
 
 	if network.IsIPv4(connectHost) {
 		cfg.ConnectIP = connectHost
+		cfg.ConnectIPv4s = []string{connectHost}
 		if fakeSNIOverride != "" {
 			cfg.FakeSNI = fakeSNIOverride
 		} else {
@@ -53,17 +54,25 @@ func ConnectFromCLI(listenAddr, connectAddr, fakeSNIOverride string) (*Config, e
 	if err != nil {
 		return nil, fmt.Errorf("resolve connect host %q: %w", connectHost, err)
 	}
-	var ip4 net.IP
+	seen := make(map[string]struct{})
+	var ip4s []string
 	for _, ip := range ips {
-		if v := ip.To4(); v != nil {
-			ip4 = v
-			break
+		v := ip.To4()
+		if v == nil {
+			continue
 		}
+		s := v.String()
+		if _, ok := seen[s]; ok {
+			continue
+		}
+		seen[s] = struct{}{}
+		ip4s = append(ip4s, s)
 	}
-	if ip4 == nil {
+	if len(ip4s) == 0 {
 		return nil, fmt.Errorf("no IPv4 address for connect host %q", connectHost)
 	}
-	cfg.ConnectIP = ip4.String()
+	cfg.ConnectIP = ip4s[0]
+	cfg.ConnectIPv4s = ip4s
 	if fakeSNIOverride != "" {
 		cfg.FakeSNI = fakeSNIOverride
 	} else {

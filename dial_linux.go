@@ -15,6 +15,7 @@ func dialOutgoing(
 	interfaceIPv4, connectIP string, connectPort int,
 	fakeData []byte, bypassMethod string,
 	fakeRepeat int,
+	fakeDelay, fragmentDelay time.Duration,
 	incomingSock net.Conn,
 	fakeInjector *injection.FakeTcpInjector,
 ) (outgoingSock net.Conn, conn *injection.FakeInjectiveConnection, srcPort uint16, err error) {
@@ -61,9 +62,9 @@ func dialOutgoing(
 
 			conn = injection.NewFakeInjectiveConnection(
 				nil, interfaceIPv4, connectIP, srcPort, uint16(connectPort),
-				fakeData, bypassMethod, incomingSock, fakeRepeat,
+				fakeData, bypassMethod, incomingSock, fakeRepeat, fakeDelay, fragmentDelay,
 			)
-			fakeInjector.Connections.Store(conn.ID, conn)
+			fakeInjector.RegisterConn(conn)
 			registered = true
 			return nil
 		},
@@ -71,15 +72,11 @@ func dialOutgoing(
 
 	outgoingSock, err = dialer.Dial("tcp4", targetAddr)
 	if err != nil {
-		if registered {
-			key := injection.ConnID{SrcIP: interfaceIPv4, SrcPort: srcPort, DstIP: connectIP, DstPort: uint16(connectPort)}
-			if val, ok := fakeInjector.Connections.Load(key); ok {
-				c := val.(*injection.FakeInjectiveConnection)
-				c.Mu.Lock()
-				c.Monitor = false
-				c.Mu.Unlock()
-				fakeInjector.Connections.Delete(key)
-			}
+		if registered && conn != nil {
+			conn.Mu.Lock()
+			conn.Monitor = false
+			conn.Mu.Unlock()
+			fakeInjector.UnregisterConn(conn)
 		}
 		return nil, nil, 0, err
 	}

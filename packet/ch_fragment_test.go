@@ -118,3 +118,24 @@ func TestSplitClientHelloRecord_NegativeChunkLikeZero(t *testing.T) {
 		}
 	}
 }
+
+func TestSNIValueRangeIgnoresEarlierHostnameBytes(t *testing.T) {
+	host := "example.com"
+	rec, err := BuildClientHelloRecord(host, utls.HelloChrome_Auto)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s, e, ok := sniValueRange(rec)
+	if !ok {
+		t.Fatal("sni not found")
+	}
+	mutated := append([]byte(nil), rec...)
+	copy(mutated[11:], host) // TLS random area, before the extensions block.
+	gotS, gotE, ok := sniValueRange(mutated)
+	if !ok {
+		t.Fatal("sni not found after mutation")
+	}
+	if gotS != s || gotE != e {
+		t.Fatalf("sni range moved to wrong occurrence: got %d:%d want %d:%d", gotS, gotE, s, e)
+	}
+}

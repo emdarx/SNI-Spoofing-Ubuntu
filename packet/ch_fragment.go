@@ -1,14 +1,11 @@
 package packet
 
 import (
-	"bytes"
 	"encoding/binary"
 	"fmt"
 	"io"
 	"log"
 	"time"
-
-	utls "github.com/refraction-networking/utls"
 )
 
 const maxTLSPlaintextRecord = 1<<14 + 2048
@@ -36,20 +33,101 @@ func ReadFirstTLSRecord(r io.Reader) ([]byte, error) {
 }
 
 func sniValueRange(record []byte) (start, end int, ok bool) {
-	if len(record) < 5 {
+	if len(record) < 5 || record[0] != 22 {
 		return 0, 0, false
 	}
-	payload := record[5:]
-	ch := utls.UnmarshalClientHello(payload)
-	if ch == nil || ch.ServerName == "" {
+	recordLen := int(binary.BigEndian.Uint16(record[3:5]))
+	if recordLen <= 0 || len(record) < 5+recordLen {
 		return 0, 0, false
 	}
-	host := ch.ServerName
-	idx := bytes.Index(record, []byte(host))
-	if idx < 0 {
+	hs := record[5 : 5+recordLen]
+	if len(hs) < 4 || hs[0] != 1 {
 		return 0, 0, false
 	}
-	return idx, idx + len(host), true
+	hsLen := int(hs[1])<<16 | int(hs[2])<<8 | int(hs[3])
+	if hsLen <= 0 || len(hs) < 4+hsLen {
+		return 0, 0, false
+	}
+	body := hs[4 : 4+hsLen]
+	pos := 2 + 32 // legacy_version + random
+	if len(body) < pos+1 {
+		return 0, 0, false
+	}
+	sessionLen := int(body[pos])
+	pos++
+	if len(body) < pos+sessionLen+2 {
+		return 0, 0, false
+	}
+	pos += sessionLen
+	cipherLen := int(binary.BigEndian.Uint16(body[pos : pos+2]))
+	pos += 2
+	if len(body) < pos+cipherLen+1 {
+		return 0, 0, false
+	}
+	pos += cipherLen
+	compressionLen := int(body[pos])
+	pos++
+	if len(body) < pos+compressionLen {
+		return 0, 0, false
+	}
+	pos += compressionLen
+	if len(body) == pos {
+		return 0, 0, false
+	}
+	if len(body) < pos+2 {
+		return 0, 0, false
+	}
+	extensionsLen := int(binary.BigEndian.Uint16(body[pos : pos+2]))
+	pos += 2
+	if len(body) < pos+extensionsLen {
+		return 0, 0, false
+	}
+	extensionsEnd := pos + extensionsLen
+	for pos+4 <= extensionsEnd {
+		extType := binary.BigEndian.Uint16(body[pos : pos+2])
+		extLen := int(binary.BigEndian.Uint16(body[pos+2 : pos+4]))
+		extDataStart := pos + 4
+		extDataEnd := extDataStart + extLen
+		if extDataEnd > extensionsEnd {
+			return 0, 0, false
+		}
+		if extType == 0 {
+			s, e, ok := sniNameRangeInExtension(body[extDataStart:extDataEnd])
+			if !ok {
+				return 0, 0, false
+			}
+			abs := 5 + 4 + extDataStart
+			return abs + s, abs + e, true
+		}
+		pos = extDataEnd
+	}
+	return 0, 0, false
+}
+
+func sniNameRangeInExtension(ext []byte) (start, end int, ok bool) {
+	if len(ext) < 2 {
+		return 0, 0, false
+	}
+	listLen := int(binary.BigEndian.Uint16(ext[:2]))
+	pos := 2
+	if listLen <= 0 || len(ext) < pos+listLen {
+		return 0, 0, false
+	}
+	listEnd := pos + listLen
+	for pos+3 <= listEnd {
+		nameType := ext[pos]
+		nameLen := int(binary.BigEndian.Uint16(ext[pos+1 : pos+3]))
+		nameStart := pos + 3
+		nameEnd := nameStart + nameLen
+		if nameEnd > listEnd {
+			return 0, 0, false
+		}
+		if nameType == 0 && nameLen > 0 {
+			return nameStart, nameEnd, true
+		}
+		pos = nameEnd
+	}
+	return 0, 0, false
 }
 
 func SplitClientHelloRecord(record []byte, sniChunkBytes int) [][]byte {
@@ -87,7 +165,7 @@ func SplitClientHelloRecord(record []byte, sniChunkBytes int) [][]byte {
 	return out
 }
 
-func WriteClientHelloFragments(w io.Writer, frags [][]byte, delay time.Duration, tcp interface{ SetNoDelay(bool) error }) error {
+func WriteClientHelloFragments(w io.Writer, frags [][]byte, delay time.Duration, tcp interface{ SetNoDelay(bool) error }, logEachFragment bool) error {
 	if tcp != nil {
 		_ = tcp.SetNoDelay(true)
 		defer func() { _ = tcp.SetNoDelay(false) }()
@@ -110,7 +188,9 @@ func WriteClientHelloFragments(w io.Writer, frags [][]byte, delay time.Duration,
 		if _, err := w.Write(p); err != nil {
 			return err
 		}
-		log.Printf("ClientHello fragment %d/%d sent (%d bytes)", sent, nFrag, len(p))
+		if logEachFragment {
+			log.Printf("ClientHello fragment %d/%d sent (%d bytes)", sent, nFrag, len(p))
+		}
 	}
 	return nil
 }
