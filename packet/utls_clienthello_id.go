@@ -8,7 +8,7 @@ import (
 	utls "github.com/refraction-networking/utls"
 )
 
-var DefaultClientHelloID = utls.HelloChrome_Auto
+var DefaultClientHelloID = utls.HelloFirefox_Auto
 
 var presetClientHelloIDs = []utls.ClientHelloID{
 	utls.HelloGolang, utls.HelloCustom,
@@ -105,6 +105,7 @@ func UTLSHelpGroupedCSV() string {
 	sort.Strings(clients)
 
 	var b strings.Builder
+	fmt.Fprintf(&b, "%s (legacy fixed ClientHello template)\n\n", LegacyUTLSName)
 	for _, c := range clients {
 		names := make([]string, 0, len(groups[c]))
 		for n := range groups[c] {
@@ -117,11 +118,22 @@ func UTLSHelpGroupedCSV() string {
 }
 
 func DefaultUTLSSummary() string {
-	return "chrome"
+	return "firefox"
+}
+
+// LegacyUTLSName is the -utls value that selects the fixed legacy ClientHello template.
+const LegacyUTLSName = "none"
+
+// IsLegacyUTLS reports whether s selects the legacy ClientHello (-utls none).
+func IsLegacyUTLS(s string) bool {
+	return strings.EqualFold(strings.TrimSpace(s), LegacyUTLSName)
 }
 
 func ParseClientHelloID(s string) (utls.ClientHelloID, error) {
 	s = strings.TrimSpace(s)
+	if IsLegacyUTLS(s) {
+		return utls.ClientHelloID{}, fmt.Errorf("%q selects the legacy ClientHello template (not a uTLS preset)", s)
+	}
 	if s == "" {
 		return DefaultClientHelloID, nil
 	}

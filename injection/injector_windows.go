@@ -46,10 +46,8 @@ func NewFakeTcpInjector(interfaceIP string, connectIPv4s []string, connectPort u
 	}
 
 	mtu := nicMTUForLocalIPv4(interfaceIP)
-	if mtu > 0 {
-		log.Printf("injector: NIC MTU %d for %s", mtu, interfaceIP)
-	} else {
-		log.Printf("injector: could not resolve NIC MTU for %s, using fallback MSS %d", interfaceIP, fallbackTCPPayloadMax)
+	if mtu == 0 {
+		log.Printf("injector: fallback MSS %d", fallbackTCPPayloadMax)
 	}
 
 	filter := BuildConnectWinDivertFilterAny(connectIPv4s, connectPort)
@@ -72,7 +70,7 @@ func (f *FakeTcpInjector) Start() error {
 		close(f.injectorReady)
 		return nil
 	}
-	log.Printf("injector: WinDivert open (filter %q)", f.filter)
+	log.Printf("injector: WinDivert ready")
 	if f.shutdown.Load() {
 		_ = wd.Close()
 		f.injectorOpenErr = errors.New("injector shut down during open")
@@ -170,8 +168,8 @@ func (f *FakeTcpInjector) runFakeInjection(rawCopy []byte, addr *godivert.Addres
 			conn.Mu.Unlock()
 			return
 		}
-		log.Printf("injector: fake TLS ClientHello %d/%d sent (%d bytes, %d TCP segment(s), MSS=%d)",
-			i+1, repeat, total, segPerInject, mss)
+		log.Printf("injector: fake ClientHello sent (%d/%d, %d bytes, %d segment(s))",
+			i+1, repeat, total, segPerInject)
 		if i+1 < repeat && conn.FakeDelay > 0 && !sleepWhileContinue(conn.FakeDelay, conn.IsMonitoring) {
 			return
 		}

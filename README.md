@@ -52,28 +52,46 @@ The Windows binary embeds the WinDivert driver through the local `godivert` modu
 
 ### Run
 
-Configuration is **CLI flags only**. `-listen` and `-connect` are required. `-fake-sni` is optional when `-connect` uses a hostname; otherwise it is required because the connect target is only an IP address.
+Configuration can come from CLI flags or an INI file. If `-config` is not provided, the app loads `./config.ini` when it exists. CLI flags override file values. `listen` and `connect` are required from either source; `fake-sni` is optional when `connect` uses a hostname, otherwise it is required because the connect target is only an IP address.
 
 ```bash
 # Windows (as Administrator)
-.\sni-spoofing.exe -listen 127.0.0.1:40443 -connect 188.114.98.0:443 -fake-sni auth.vercel.com
+.\sni-spoofing.exe -listen 127.0.0.1:40443 -connect 104.19.229.21:443 -fake-sni hcaptcha.com -utls firefox
 
 # Linux/OpenWrt (as root)
-sudo ./sni-spoofing-linux-amd64 -listen 127.0.0.1:40443 -connect 188.114.98.0:443 -fake-sni auth.vercel.com
+sudo ./sni-spoofing-linux-amd64 -listen 127.0.0.1:40443 -connect 104.19.229.21:443 -fake-sni hcaptcha.com -utls firefox
 ```
 
 Useful options:
 
 | Flag | Default | Meaning |
 | ---- | ------- | ------- |
+| `-config` | `./config.ini` if it exists | INI config file; CLI flags override file values |
 | `-fake-sni` | hostname from `-connect` | Decoy SNI used in the injected fake ClientHello |
 | `-fake-repeat` | `1` | Number of fake ClientHello injections |
 | `-fake-delay` | `2ms` | Delay after fake injection before forwarding real traffic |
 | `-ack-timeout` | `2s` | Max wait for the server response after fake injection |
-| `-utls` | `chrome` | TLS fingerprint preset; run with `-h` to list all presets |
+| `-utls` | `firefox` | TLS fingerprint preset; use `none` for the legacy fixed ClientHello template; run with `-h` to list all presets |
 | `-enable-fragment` | disabled | Split the real ClientHello after fake injection |
 | `-fragment-delay` | `500ms` | Delay between split real ClientHello writes |
-| `-sni-chunk` | `3` | SNI bytes per write when `-enable-fragment` is set; `0` means the whole hostname |
+| `-sni-chunk` | `3` | SNI bytes per write when `-enable-fragment` is set; `0` means the whole hostname; for `hcaptcha.com`, `3` writes `hca`, `ptc`, `ha.`, `com` |
+
+Example config:
+
+```ini
+listen = 127.0.0.1:40443
+connect = 104.19.229.21:443
+fake-sni = hcaptcha.com
+utls = firefox
+fake-repeat = 1
+fake-delay = 2ms
+ack-timeout = 2s
+enable-fragment = false
+fragment-delay = 500ms
+sni-chunk = 3
+```
+
+The repository includes `config.example.ini`; copy it to `config.ini` to use the automatic default config loading.
 
 ### Docker (prebuilt image)
 
@@ -85,8 +103,9 @@ docker run --rm -it \
   --cap-add NET_ADMIN --cap-add NET_RAW \
   ghcr.io/aleskxyz/sni-spoofing-go:latest \
   -listen 127.0.0.1:40443 \
-  -connect 188.114.98.0:443 \
-  -fake-sni auth.vercel.com
+  -connect 104.19.229.21:443 \
+  -fake-sni hcaptcha.com \
+  -utls firefox
 ```
 
 #### For Iranian users
@@ -108,8 +127,9 @@ podman run --rm -it \
   --cap-add NET_ADMIN --cap-add NET_RAW \
   ghcr.hamdocker.ir/aleskxyz/sni-spoofing-go:latest \
   -listen 127.0.0.1:40443 \
-  -connect 188.114.98.0:443 \
-  -fake-sni auth.vercel.com
+  -connect 104.19.229.21:443 \
+  -fake-sni hcaptcha.com \
+  -utls firefox
 ```
 
 ### Test (Cloudflare example)
@@ -125,19 +145,17 @@ Remember: the **real target SNI** comes from the client request (`Host`/URL), wh
 
 Use `curl` with `--resolve` so the TLS SNI/host stays the hostname you’re testing while connecting to your local listener.
 
-Example (ASCII-art PoC via `one.one.one.one`; decoy SNI = `auth.vercel.com`):
+Example (ASCII-art PoC via `one.one.one.one`; decoy SNI = `hcaptcha.com`):
 
 ```bash
-# Pick a real Cloudflare edge IP for the hostname you're testing:
-CF_IP="$(host auth.vercel.com | awk '/has address/ {print $4}' | head -n1)"
-
 sudo ./sni-spoofing-linux-amd64 \
-  -listen 127.0.0.1:8080 \
-  -connect "${CF_IP}:443" \
-  -fake-sni auth.vercel.com
+  -listen 127.0.0.1:40443 \
+  -connect 104.19.229.21:443 \
+  -fake-sni hcaptcha.com \
+  -utls firefox
 
 # PoC: fetch a real page through the local listener while keeping SNI/Host correct.
-curl -sSLf --resolve one.one.one.one:8080:127.0.0.1 https://one.one.one.one:8080/ | grep '^\.\.'
+curl -sSLf --resolve one.one.one.one:40443:127.0.0.1 https://one.one.one.one:40443/ | grep '^\.\.'
 
 # Expected output:
 # ............................................................

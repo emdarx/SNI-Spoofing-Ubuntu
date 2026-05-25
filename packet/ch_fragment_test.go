@@ -101,6 +101,45 @@ func TestSplitClientHelloRecord_SNIChunkZero_OneHostnameWrite(t *testing.T) {
 	}
 }
 
+func TestSplitClientHelloRecord_SNIChunkIsByteCount(t *testing.T) {
+	host := "hcaptcha.com"
+	rec, err := BuildClientHelloRecord(host, utls.HelloFirefox_Auto)
+	if err != nil {
+		t.Fatal(err)
+	}
+	frags := SplitClientHelloRecord(rec, 3)
+	s, e, ok := sniValueRange(rec)
+	if !ok {
+		t.Fatal("sni")
+	}
+	fi := 0
+	if s > 0 {
+		fi = 1
+	}
+	var got [][]byte
+	for pos := s; pos < e; pos += 3 {
+		if fi >= len(frags) {
+			t.Fatalf("missing hostname chunk at %d", pos)
+		}
+		got = append(got, frags[fi])
+		fi++
+	}
+	want := [][]byte{
+		[]byte("hca"),
+		[]byte("ptc"),
+		[]byte("ha."),
+		[]byte("com"),
+	}
+	if len(got) != len(want) {
+		t.Fatalf("hostname chunks = %q, want %q", got, want)
+	}
+	for i := range want {
+		if !bytes.Equal(got[i], want[i]) {
+			t.Fatalf("hostname chunk %d = %q, want %q", i, got[i], want[i])
+		}
+	}
+}
+
 func TestSplitClientHelloRecord_NegativeChunkLikeZero(t *testing.T) {
 	host := "example.com"
 	rec, err := BuildClientHelloRecord(host, utls.HelloChrome_Auto)

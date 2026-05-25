@@ -1,7 +1,7 @@
-// Package config holds runtime settings built from CLI flags.
+// Package config holds runtime settings built from CLI flags and config files.
 package config
 
-// Config is the proxy and injection settings for one run (filled from CLI flags in main).
+// Config is the proxy and injection settings for one run.
 type Config struct {
 	ListenHost      string
 	ListenPort      int
@@ -9,5 +9,5 @@ type Config struct {
 	ConnectIPv4s    []string // all distinct IPv4 addresses resolved for -connect (order preserved from DNS)
 	ConnectPort     int
 	FakeSNI         string
-	UTLSClientHello string // uTLS preset name; empty means default (HelloChrome_Auto)
+	UTLSClientHello string // uTLS preset name; empty means default (HelloFirefox_Auto); "none" means legacy template
 }

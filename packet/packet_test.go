@@ -38,12 +38,36 @@ func TestBuildClientHelloRecord_EmptyServerName(t *testing.T) {
 	}
 }
 
+func TestBuildLegacyClientHelloRecord(t *testing.T) {
+	host := "auth.vercel.com"
+	record, err := BuildLegacyClientHelloRecord(host)
+	if err != nil {
+		t.Fatalf("BuildLegacyClientHelloRecord: %v", err)
+	}
+	if len(record) != 517 {
+		t.Fatalf("legacy ClientHello length = %d, want 517", len(record))
+	}
+	if record[0] != 0x16 {
+		t.Errorf("expected TLS record type 0x16, got 0x%02x", record[0])
+	}
+	if !bytes.Contains(record, []byte(host)) {
+		t.Errorf("record does not contain SNI hostname %q", host)
+	}
+}
+
+func TestBuildLegacyClientHelloRecord_TooLongServerName(t *testing.T) {
+	_, err := BuildLegacyClientHelloRecord(strings.Repeat("a", MaxLegacyFakeSNILen+1))
+	if err == nil {
+		t.Fatal("expected error for too-long server name")
+	}
+}
+
 func TestParseClientHelloID(t *testing.T) {
 	for _, tc := range []struct {
 		in   string
 		want utls.ClientHelloID
 	}{
-		{"", DefaultClientHelloID},
+		{"", utls.HelloFirefox_Auto},
 		{"chrome_133", utls.HelloChrome_133},
 		{"chrome", utls.HelloChrome_Auto},
 		{"Firefox-120", utls.HelloFirefox_120},
@@ -67,11 +91,27 @@ func TestParseClientHelloID(t *testing.T) {
 	if _, err := ParseClientHelloID("hellofirefox_120"); err == nil {
 		t.Fatal("expected error for hello* form")
 	}
+	if _, err := ParseClientHelloID("none"); err == nil {
+		t.Fatal("expected error for legacy none preset")
+	}
+}
+
+func TestIsLegacyUTLS(t *testing.T) {
+	for _, s := range []string{"none", " None ", "NONE"} {
+		if !IsLegacyUTLS(s) {
+			t.Fatalf("IsLegacyUTLS(%q) = false, want true", s)
+		}
+	}
+	for _, s := range []string{"", "chrome", "none_"} {
+		if IsLegacyUTLS(s) {
+			t.Fatalf("IsLegacyUTLS(%q) = true, want false", s)
+		}
+	}
 }
 
 func TestUTLSHelpGroupedCSV(t *testing.T) {
 	s := UTLSHelpGroupedCSV()
-	if len(s) < 100 || !strings.Contains(s, "chrome_120") || !strings.Contains(s, "chrome,") {
+	if len(s) < 100 || !strings.Contains(s, "none") || !strings.Contains(s, "chrome_120") || !strings.Contains(s, "chrome,") {
 		t.Fatalf("unexpected grouped help: len=%d", len(s))
 	}
 }

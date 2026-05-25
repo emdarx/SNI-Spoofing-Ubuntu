@@ -102,10 +102,8 @@ func NewFakeTcpInjector(interfaceIP string, connectIPv4s []string, connectPort u
 		rawFd:         -1,
 		injectorReady: make(chan struct{}),
 	}
-	if mtu > 0 {
-		log.Printf("injector: NIC MTU %d for %s", mtu, interfaceIP)
-	} else {
-		log.Printf("injector: could not resolve NIC MTU for %s, using fallback MSS %d", interfaceIP, fallbackTCPPayloadMax)
+	if mtu == 0 {
+		log.Printf("injector: fallback MSS %d", fallbackTCPPayloadMax)
 	}
 
 	fd, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_RAW, syscall.IPPROTO_RAW)
@@ -137,10 +135,8 @@ func NewFakeTcpInjector(interfaceIP string, connectIPv4s []string, connectPort u
 	}
 
 	maxQLen := nfqueueMaxQueueLenFromSysctl()
-	if maxQLen == 0 {
-		log.Printf("injector: nfqueue MaxQueueLen: default (unreadable sysctl %s)", sysctlNetNFQueueMaxLen)
-	} else {
-		log.Printf("injector: nfqueue MaxQueueLen: %d (from %s)", maxQLen, sysctlNetNFQueueMaxLen)
+	if maxQLen > 0 {
+		log.Printf("nfqueue: max queue %d", maxQLen)
 	}
 	cfg := nfqueue.Config{
 		NfQueue:      f.nfqueueNum,
@@ -157,10 +153,9 @@ func NewFakeTcpInjector(interfaceIP string, connectIPv4s []string, connectPort u
 	}
 	rcv := netlinkRecvBufFromSysctl()
 	if err := nf.Con.SetReadBuffer(rcv); err != nil {
-		log.Printf("injector: nfqueue SetReadBuffer(%d): %v (continuing with default)", rcv, err)
+		log.Printf("nfqueue: recv buffer unchanged: %v", err)
 	} else if rcv < desiredNetlinkRcvBuf {
-		log.Printf("injector: nfqueue recv buffer %d bytes (capped by %s; raise net.core.rmem_max for up to %d)",
-			rcv, sysctlNetCoreRmemMax, desiredNetlinkRcvBuf)
+		log.Printf("nfqueue: recv buffer %d", rcv)
 	}
 	f.nf = nf
 
@@ -238,7 +233,7 @@ func (f *FakeTcpInjector) setupIptables() error {
 		return fmt.Errorf("iptables INPUT rule: %w", err)
 	}
 
-	log.Printf("iptables rules set up (queue %s, mark %s)", queueNum, mark)
+	log.Printf("iptables: ready queue=%s mark=%s", queueNum, mark)
 	return nil
 }
 
@@ -256,7 +251,7 @@ func (f *FakeTcpInjector) cleanupIptables() {
 		"-s", f.connectIP, "--sport", port,
 		"-j", "NFQUEUE", "--queue-num", queueNum)
 
-	log.Println("iptables rules cleaned up")
+	log.Print("iptables: cleaned")
 }
 
 func runCmd(name string, args ...string) error {
@@ -567,8 +562,8 @@ func (f *FakeTcpInjector) runFakeInjectionLocked(rawCopy []byte, conn *FakeInjec
 			conn.Mu.Unlock()
 			return
 		}
-		log.Printf("injector: fake TLS ClientHello %d/%d sent (%d bytes, %d TCP segment(s), MSS=%d)",
-			i+1, repeat, total, segPerInject, mss)
+		log.Printf("injector: fake ClientHello sent (%d/%d, %d bytes, %d segment(s))",
+			i+1, repeat, total, segPerInject)
 		if i+1 < repeat && conn.FakeDelay > 0 && !sleepWhileContinue(conn.FakeDelay, conn.IsMonitoring) {
 			return
 		}
